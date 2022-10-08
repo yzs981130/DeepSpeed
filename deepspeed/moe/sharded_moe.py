@@ -22,6 +22,7 @@ from torch.nn import Module
 import torch.nn.functional as F
 from deepspeed.utils import groups
 from .mappings import drop_tokens, gather_tokens
+import torch.cuda.nvtx as nvtx
 
 if TYPE_CHECKING:
     Base = Module[Tensor]
@@ -404,6 +405,9 @@ class TopKGate(Module):
         if self.wall_clock_breakdown:
             self.timers('TopKGate').start()
 
+        torch.cuda.synchronize()
+        nvtx.range_push('TopKGate')
+
         if self.wg.weight.dtype != torch.float32:
             self.wg = self.wg.float()
         input_fp32 = input.float()
@@ -432,6 +436,9 @@ class TopKGate(Module):
         if self.wall_clock_breakdown:
             self.timers('TopKGate').stop()
             self.gate_time = self.timers('TopKGate').elapsed(reset=False)
+        
+        torch.cuda.synchronize()
+        nvtx.range_pop()
 
         return gate_output
 
@@ -493,6 +500,9 @@ class MOELayer(Base):
         if self.wall_clock_breakdown:
             self.timers('moe').start()
 
+        torch.cuda.synchronize()
+        nvtx.range_push('moe forward')
+
         # Implement Algorithm 2 from GShard paper.
         d_model = input[0].shape[-1]
 
@@ -515,12 +525,18 @@ class MOELayer(Base):
             dispatched_input = self._tutel_dispatcher.encode(reshaped_input)
         else:
             self.l_aux, combine_weights, dispatch_mask, self.exp_counts = self.gate(reshaped_input, input[1])
+            torch.cuda.synchronize()
+            nvtx.range_push('f_reshape')
             dispatched_input = einsum("sec,sm->ecm",
                                       dispatch_mask.type_as(input[0]),
                                       reshaped_input)
+            torch.cuda.synchronize()
+            nvtx.range_pop()
 
         if self.wall_clock_breakdown:
             self.timers('falltoall').start()
+
+        nvtx.range_push('fall_to_all')
 
         if groups._get_expert_model_parallel_world_size() == 1:
             # If the non-expert is tensor-parallel, it will create
@@ -537,23 +553,34 @@ class MOELayer(Base):
             self.timers('falltoall').stop()
             self.time_falltoall = self.timers('falltoall').elapsed(reset=False)
 
+        torch.cuda.synchronize()
+        nvtx.range_pop()
         # Re-shape after all-to-all: ecm -> gecm
         dispatched_input = dispatched_input.reshape(self.ep_size,
                                                     self.num_local_experts,
                                                     -1,
                                                     d_model)
 
+        torch.cuda.synchronize()
+        nvtx.range_push('expert_local')
         expert_output = self.experts(dispatched_input)
 
+        torch.cuda.synchronize()
+        nvtx.range_pop()
         if self.wall_clock_breakdown:
             self.timers('salltoall').start()
 
+        torch.cuda.synchronize()
+        nvtx.range_push('sall_to_all')
         expert_output = _AllToAll.apply(self.ep_group, expert_output)
 
         if self.wall_clock_breakdown:
             self.timers('salltoall').stop()
             self.time_salltoall = self.timers('salltoall').elapsed(reset=False)
 
+        torch.cuda.synchronize()
+        nvtx.range_pop()
+        nvtx.range_push('s_reshape')
         # Re-shape back: gecm -> ecm
         expert_output = expert_output.reshape(self.ep_size * self.num_local_experts,
                                               -1,
@@ -574,8 +601,13 @@ class MOELayer(Base):
 
         a = combined_output.reshape(input[0].shape)
 
+        torch.cuda.synchronize()
+        nvtx.range_pop()
+
         if self.wall_clock_breakdown:
             self.timers('moe').stop()
             self.time_moe = self.timers('moe').elapsed(reset=False)
 
+        torch.cuda.synchronize()
+        nvtx.range_pop()
         return a

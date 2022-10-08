@@ -10,6 +10,7 @@ from deepspeed.utils import groups
 from .sharded_moe import MOELayer, TopKGate
 from .experts import Experts
 import typing
+import torch.cuda.nvtx as nvtx
 
 
 class MoE(torch.nn.Module):
