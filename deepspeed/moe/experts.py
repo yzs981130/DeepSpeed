@@ -20,6 +20,7 @@ class Experts(torch.nn.Module):
             for name, param in expert.named_parameters():
                 param.allreduce = False
                 param.group_name = expert_group_name
+                param.expert = True
 
     def forward(self, inputs):
         chunks = inputs.chunk(self.num_local_experts, dim=1)
