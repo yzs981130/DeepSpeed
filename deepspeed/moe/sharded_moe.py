@@ -24,6 +24,23 @@ from deepspeed.utils import groups
 from .mappings import drop_tokens, gather_tokens
 import torch.cuda.nvtx as nvtx
 
+import os
+import logging
+
+
+def tensor_info(x: Tensor):
+    if x is None:
+        return "None"
+    if type(x) is tuple:
+        return f"tuple({len(x)})"
+    return (f"shape: {x.shape}, numel: {torch.numel(x)}, dtype: {x.dtype}, device: {x.device}")
+
+
+def dist_log(msg: str):
+    world_rank = os.getenv('RANK', '0')
+    logging.info(f"[{world_rank}] {msg}")
+
+
 if TYPE_CHECKING:
     Base = Module[Tensor]
 else:
@@ -126,6 +143,7 @@ def einsum(rule, a, b):
         e = a.shape[1]
         c = a.shape[2]
         m = b.shape[1]
+        # 先合并ec再转置，乘完了再拆出ec
         return torch.matmul(a.reshape(s, -1).t(), b).reshape(e, c, m)
     elif rule == 'sec,ecm->sm':
         return torch.matmul(a.reshape(a.shape[0], -1), b.reshape(-1, b.shape[-1]))
@@ -284,16 +302,25 @@ def top2gating(logits: Tensor,
                                            Tensor]:
     """Implements Top2Gating on logits."""
     # everything is in fp32 in this function
+    torch.set_printoptions(profile="full")
+    # logits shape: [seq_length * bsz, num_experts]
+    dist_log(f"top2gating input: {tensor_info(logits)}")
     gates = F.softmax(logits, dim=1)
 
     capacity = _capacity(gates,
                          torch.tensor(capacity_factor * 2),
                          torch.tensor(min_capacity))
+    # capacity: max(seq_length * bsz * 2 // num_experts, min_capacity) 512
+    dist_log(f"capacity: {capacity}")
 
     # Create a mask for 1st's expert per token
     indices1_s = torch.argmax(gates, dim=1)
+    # indices1_s shape: [seq_length * bsz]
+    dist_log(f"indices1_s: {tensor_info(indices1_s)}")
     num_experts = int(gates.shape[1])
     mask1 = F.one_hot(indices1_s, num_classes=num_experts)
+    # mask1同样为token发往的expert为1，其他为0
+    dist_log(f"mask1: {tensor_info(mask1)}")
 
     # Create a mask for 2nd's expert per token using Gumbel-max trick
     # https://timvieira.github.io/blog/post/2014/07/31/gumbel-max-trick/
@@ -309,8 +336,12 @@ def top2gating(logits: Tensor,
     # Update 2nd's location by accounting for locations of 1st
     locations2 += torch.sum(mask1, dim=0, keepdim=True)
 
+    dist_log(f"locations1: {tensor_info(locations1)}")
+
     # gating decisions
     exp_counts = torch.sum(mask1, dim=0).detach().to('cpu')
+    # exp_counts shape: [num_experts]
+    dist_log(f"exp_counts: {tensor_info(exp_counts)}")
 
     # Compute l_aux
     me = torch.mean(gates, dim=0)
@@ -325,9 +356,13 @@ def top2gating(logits: Tensor,
     locations1_s = torch.sum(locations1 * mask1, dim=1)
     locations2_s = torch.sum(locations2 * mask2, dim=1)
 
+    # locations1_s shape: [seq_length * bsz]
+    dist_log(f"locations1_s: {tensor_info(locations1_s)}")
+
     # Normalize gate probabilities
     mask1_float = mask1.float()
     mask2_float = mask2.float()
+    # s = seq_length * bsz, e = num_experts, c = capacity
     gates1_s = einsum("se,se->s", gates, mask1_float)
     gates2_s = einsum("se,se->s", gates, mask2_float)
     denom_s = gates1_s + gates2_s
@@ -336,16 +371,24 @@ def top2gating(logits: Tensor,
     gates1_s /= denom_s
     gates2_s /= denom_s
 
+    # gates1_s shape: [seq_length * bsz], 为每个token在所发往的expert上的分数
     # Calculate combine_weights and dispatch_mask
     gates1 = einsum("s,se->se", gates1_s, mask1_float)
+    # gates1 shape: [seq_length * bsz, num_experts], 为每个token在所发往的expert上的分数其他全0
     gates2 = einsum("s,se->se", gates2_s, mask2_float)
     locations1_sc = _one_hot_to_float(locations1_s, capacity)
+    # locations1_sc shape: [seq_length * bsz, capacity]，为按capacity做onehot；相当于每个token在其所发往的expert的哪个位置上
     locations2_sc = _one_hot_to_float(locations2_s, capacity)
     combine1_sec = einsum("se,sc->sec", gates1, locations1_sc)
     combine2_sec = einsum("se,sc->sec", gates2, locations2_sc)
+    # combine1_sec shape: [seq_length * bsz, num_experts, capacity]，对每个token，所发往expert上属于自己的那一个位置为分数，其余所有为0，非常稀疏
     combine_weights = combine1_sec + combine2_sec
     dispatch_mask = combine_weights.bool()
 
+    dist_log(f"combine_weights: {tensor_info(combine_weights)}")
+    dist_log(f"dispatch_mask: {tensor_info(dispatch_mask)}")
+    # dispatch_mask shape: [seq_length * bsz, num_experts, capacity]
+    torch.set_printoptions(profile="default")
     return l_aux, combine_weights, dispatch_mask, exp_counts
 
 
@@ -414,7 +457,9 @@ class TopKGate(Module):
         # input jittering
         if self.noisy_gate_policy == 'Jitter' and self.training:
             input_fp32 = multiplicative_jitter(input_fp32, device=input.device)
+        # input_fp32 shape: [seq_length * bsz, model_dim]
         logits = self.wg(input_fp32)
+        # logits shape: [seq_length * bsz, num_experts]
 
         if self.k == 1:
             gate_output = top1gating(
@@ -502,6 +547,7 @@ class MOELayer(Base):
 
         torch.cuda.synchronize()
         nvtx.range_push('moe forward')
+        dist_log(f"moe_layer input: {tensor_info(input[0])}")
 
         # Implement Algorithm 2 from GShard paper.
         d_model = input[0].shape[-1]
@@ -511,6 +557,8 @@ class MOELayer(Base):
         # group_size = kwargs['group_size'] if 'group_size' in kwargs.keys() else 1
         reshaped_input = input[0].reshape(-1, d_model)
 
+        # reshaped_input: torch.Size([seq_length * bsz, model_dim])
+        dist_log(f"moe_layer reshaped_input: {tensor_info(reshaped_input)}")
         if self.use_tutel:
             self.l_aux, C, E, indices_, locations_, gates_, self.exp_counts = self.gate(reshaped_input, input[1], True)
             S, M = reshaped_input.size(0), reshaped_input.size(1)
@@ -530,6 +578,8 @@ class MOELayer(Base):
             dispatched_input = einsum("sec,sm->ecm",
                                       dispatch_mask.type_as(input[0]),
                                       reshaped_input)
+            # dispatched_input shape: [num_experts, capacity, d_model]
+            dist_log(f"moe_layer dispatched_input: {tensor_info(dispatched_input)}")
             torch.cuda.synchronize()
             nvtx.range_pop()
 
@@ -548,6 +598,7 @@ class MOELayer(Base):
             dispatched_input = drop_tokens(dispatched_input, dim=1)
 
         dispatched_input = _AllToAll.apply(self.ep_group, dispatched_input)
+        dist_log(f"moe_layer fall_to_all output: {tensor_info(dispatched_input)}")
 
         if self.wall_clock_breakdown:
             self.timers('falltoall').stop()
@@ -561,9 +612,11 @@ class MOELayer(Base):
                                                     -1,
                                                     d_model)
 
+        dist_log(f"moe_layer expert input: {tensor_info(dispatched_input)}")
         torch.cuda.synchronize()
         nvtx.range_push('expert_local')
         expert_output = self.experts(dispatched_input)
+        dist_log(f"moe_layer expert output: {tensor_info(expert_output)}")
 
         torch.cuda.synchronize()
         nvtx.range_pop()
@@ -573,6 +626,7 @@ class MOELayer(Base):
         torch.cuda.synchronize()
         nvtx.range_push('sall_to_all')
         expert_output = _AllToAll.apply(self.ep_group, expert_output)
+        dist_log(f"moe_layer sall_to_all output: {tensor_info(expert_output)}")
 
         if self.wall_clock_breakdown:
             self.timers('salltoall').stop()
@@ -585,6 +639,7 @@ class MOELayer(Base):
         expert_output = expert_output.reshape(self.ep_size * self.num_local_experts,
                                               -1,
                                               d_model)
+        dist_log(f"moe_layer s_reshape_1 output: {tensor_info(expert_output)}")
 
         if groups._get_expert_model_parallel_world_size() == 1:
             # the dropped duplicate tokens need to be gathered on each
@@ -598,7 +653,7 @@ class MOELayer(Base):
             combined_output = einsum("sec,ecm->sm",
                                      combine_weights.type_as(input[0]),
                                      expert_output)
-
+        dist_log(f"moe_layer s_reshape_2 output: {tensor_info(combined_output)}")
         a = combined_output.reshape(input[0].shape)
 
         torch.cuda.synchronize()
@@ -610,4 +665,5 @@ class MOELayer(Base):
 
         torch.cuda.synchronize()
         nvtx.range_pop()
+        dist_log(f"moe_layer output: {tensor_info(a)}")
         return a
